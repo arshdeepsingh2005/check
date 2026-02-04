@@ -69,7 +69,7 @@ def _resolve_user_from_request():
     if auth_service:
         try:
             logger.info(f"WS: Attempting synchronous DB lookup for {normalized}")
-            user_record = auth_service.lookup_user_sync(normalized, timeout=1.0)
+            user_record = auth_service.lookup_user_sync(normalized, timeout=2.0)
             if user_record:
                 logger.info(f"WS: User {normalized} found in DB")
                 return user_record
