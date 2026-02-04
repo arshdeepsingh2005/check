@@ -67,7 +67,7 @@ def _resolve_user_for_sse(user: str) -> Optional[dict]:
     # Increased timeout to 1s for Render DB latency
     try:
         logger.info(f"Attempting synchronous DB lookup for {normalized}")
-        user_record = auth_service.lookup_user_sync(normalized, timeout=1.0)
+        user_record = auth_service.lookup_user_sync(normalized, timeout=4.0)
         if user_record and user_record.get("user_id"):
             logger.info(f"User {normalized} found in DB")
             return user_record
