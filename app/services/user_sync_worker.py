@@ -65,4 +65,3 @@ class UserSyncWorker:
 
 
 user_sync_worker = UserSyncWorker()
-
