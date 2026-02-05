@@ -18,6 +18,7 @@ class UserAuthService:
         self._connect()
     
     def _connect(self) -> None:
+        """Establish Redis connection with Render survival flags."""
         try:
             redis_url = self.config.REDIS_URL
             if not redis_url:
@@ -29,7 +30,8 @@ class UserAuthService:
                 'socket_connect_timeout': self.config.REDIS_SOCKET_CONNECT_TIMEOUT,
                 'socket_timeout': self.config.REDIS_SOCKET_TIMEOUT,
                 'retry_on_timeout': True,
-                'health_check_interval': 30
+                'health_check_interval': 30,
+                'socket_keepalive': True  # Keep connection alive on Render
             }
             
             if redis_url.startswith('rediss://'):
@@ -43,6 +45,29 @@ class UserAuthService:
         except (RedisConnectionError, Exception) as e:
             logger.error(f"Failed to connect to Redis: {e}")
             self.redis_client = None
+
+    def get_redis_client(self) -> Optional[redis.Redis]:
+        """
+        Self-healing Redis client access.
+        Attempts to reconnect if the client is missing or disconnected.
+        """
+        try:
+            if self.redis_client is None:
+                logger.info("Redis client is None, attempting to reconnect...")
+                self._connect()
+            
+            if self.redis_client:
+                # Quick ping to ensure connection is still valid
+                self.redis_client.ping()
+                return self.redis_client
+        except RedisError as e:
+            logger.warning(f"Redis transient error during health check: {e}")
+            self.redis_client = None
+            # Try one immediate reconnection attempt
+            self._connect()
+            return self.redis_client
+        
+        return None
     
     def _get_user_key(self, username: str) -> str:
         return f"{self.USER_KEY_PREFIX}{username.lower()}"
@@ -51,11 +76,12 @@ class UserAuthService:
         return f"{self.RATE_LIMIT_PREFIX}{username.lower()}"
     
     def _is_rate_limited(self, username: str) -> bool:
-        if not self.redis_client:
+        client = self.get_redis_client()
+        if not client:
             return False
         try:
             rate_limit_key = self._get_rate_limit_key(username)
-            is_limited = self.redis_client.exists(rate_limit_key) > 0
+            is_limited = client.exists(rate_limit_key) > 0
             if is_limited:
                 logger.debug(f"User {username} is currently rate limited in Redis")
             return is_limited
@@ -64,11 +90,12 @@ class UserAuthService:
             return False
     
     def _set_rate_limit(self, username: str) -> None:
-        if not self.redis_client:
+        client = self.get_redis_client()
+        if not client:
             return
         try:
             rate_limit_key = self._get_rate_limit_key(username)
-            self.redis_client.setex(rate_limit_key, self.RATE_LIMIT_TTL, "1")
+            client.setex(rate_limit_key, self.RATE_LIMIT_TTL, "1")
             logger.debug(f"Set rate limit for {username} in Redis for {self.RATE_LIMIT_TTL}s")
         except RedisError as e:
             logger.error(f"Redis error setting rate limit for {username}: {e}")
@@ -76,7 +103,8 @@ class UserAuthService:
     
     def verify_username(self, username: str) -> Optional[dict]:
         logger.debug(f"Verifying username: {username}")
-        if not self.redis_client:
+        client = self.get_redis_client()
+        if not client:
             logger.warning("Redis client not available for verify_username")
             return None
         if not username:
@@ -84,7 +112,7 @@ class UserAuthService:
         
         try:
             user_key = self._get_user_key(username)
-            user_data = self.redis_client.hgetall(user_key)
+            user_data = client.hgetall(user_key)
             
             if user_data and user_data.get('user_id'):
                 logger.info(f"User {username} found in Redis: {user_data}")
@@ -144,14 +172,15 @@ class UserAuthService:
             pass
     
     def set_user(self, username: str, user_id: int) -> bool:
-        if not self.redis_client:
+        client = self.get_redis_client()
+        if not client:
             logger.warning("Redis client not available for set_user")
             return False
         
         try:
             user_key = self._get_user_key(username)
             logger.info(f"Caching user {username} (ID: {user_id}) to Redis at {user_key}")
-            success = bool(self.redis_client.hset(
+            success = bool(client.hset(
                 user_key,
                 mapping={
                     'user_id': str(user_id),
@@ -166,19 +195,21 @@ class UserAuthService:
             return False
     
     def delete_user(self, username: str) -> bool:
-        if not self.redis_client:
+        client = self.get_redis_client()
+        if not client:
             return False
         
         try:
             user_key = self._get_user_key(username)
             logger.info(f"Deleting user {username} from Redis")
-            return self.redis_client.delete(user_key) > 0
+            return client.delete(user_key) > 0
         except RedisError as e:
             logger.error(f"Redis error in delete_user for {username}: {e}")
             return False
     
     def remove_stale_users(self, valid_usernames: set) -> int:
-        if not self.redis_client:
+        client = self.get_redis_client()
+        if not client:
             return 0
         
         try:
@@ -189,7 +220,7 @@ class UserAuthService:
             
             cursor = 0
             while True:
-                cursor, keys = self.redis_client.scan(cursor, match=pattern, count=100)
+                cursor, keys = client.scan(cursor, match=pattern, count=100)
                 
                 for key in keys:
                     username_from_key = key.replace(self.USER_KEY_PREFIX, "").lower()
@@ -201,7 +232,7 @@ class UserAuthService:
             
             if keys_to_delete:
                 logger.info(f"Removing {len(keys_to_delete)} stale users from Redis")
-                pipe = self.redis_client.pipeline()
+                pipe = client.pipeline()
                 for i in range(0, len(keys_to_delete), pipeline_batch_size):
                     batch = keys_to_delete[i:i + pipeline_batch_size]
                     for key in batch:
@@ -215,13 +246,14 @@ class UserAuthService:
             return 0
     
     def sync_users(self, users: list) -> int:
-        if not self.redis_client:
+        client = self.get_redis_client()
+        if not client:
             return 0
         
         try:
             logger.info(f"Syncing {len(users)} users to Redis")
             count = 0
-            pipe = self.redis_client.pipeline()
+            pipe = client.pipeline()
             
             for user in users:
                 user_key = self._get_user_key(user['username'])
@@ -290,15 +322,7 @@ class UserAuthService:
             return None
     
     def is_available(self) -> bool:
-        if not self.redis_client:
-            return False
-        try:
-            self.redis_client.ping()
-            return True
-        except RedisError:
-            logger.error("Redis connection lost")
-            self.redis_client = None
-            return False
+        return self.get_redis_client() is not None
 
 
 user_auth_service: Optional[UserAuthService] = None
